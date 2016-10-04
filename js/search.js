@@ -1,0 +1,1515 @@
+/**
+ * Search
+ *
+ * Basically just an improved version of utilichart
+ *
+ * Dependencies: jQuery, battledata, search-index
+ * Optional dependencies: pokedex, moves, items, abilities
+ *
+ * @author  Guangcong Luo <Zarel>
+ */
+
+(function (exports, $) {
+	'use strict';
+
+	function Search(elem, viewport) {
+		this.$el = $(elem);
+		this.el = this.$el[0];
+		this.$viewport = (viewport ? $(viewport) : $(window));
+
+		this.urlRoot = '';
+		this.q = undefined; // uninitialized
+		this.qType = '';
+		this.defaultResultSet = null;
+		this.legalityFilter = null;
+		this.legalityLabel = "Illegal";
+		this.exactMatch = false;
+
+		this.resultSet = null;
+		this.filters = null;
+		this.sortCol = null;
+		this.renderedIndex = 0;
+		this.renderingDone = true;
+		this.cur = {};
+		this.$inputEl = null;
+		this.gen = 6;
+
+		var self = this;
+		this.$el.on('click', '.more button', function (e) {
+			e.preventDefault();
+			self.updateScroll(true);
+		});
+		this.$el.on('click', '.filter', function (e) {
+			e.preventDefault();
+			if (!self.filters) return;
+			// delete filter
+			for (var i = 0; i < self.filters.length; i++) {
+				if (e.currentTarget.value === self.filters[i].join(':')) {
+					self.filters.splice(i, 1);
+					if (!self.filters.length) self.filters = null;
+					self.q = undefined;
+					self.find('');
+					break;
+				}
+			}
+			if (self.$inputEl) self.$inputEl.focus();
+		});
+		this.$el.on('click', '.sortcol', function (e) {
+			e.preventDefault();
+			e.stopPropagation();
+			var sortCol = e.currentTarget.dataset.sort;
+			if (self.sortCol === sortCol) {
+				self.sortCol = null;
+			} else {
+				self.sortCol = sortCol;
+			}
+			self.q = undefined;
+			self.find('');
+		});
+	}
+
+	Search.prototype.$ = function (query) {
+		return this.$el.find(query);
+	};
+
+	//
+	// Search functions
+	//
+
+	var typeTable = {
+		pokemon: 1,
+		type: 2,
+		tier: 3,
+		move: 4,
+		item: 5,
+		ability: 6,
+		egggroup: 7,
+		category: 8
+	};
+	var typeName = {
+		pokemon: 'Pok&eacute;mon',
+		type: 'Type',
+		tier: 'Tiers',
+		move: 'Moves',
+		item: 'Items',
+		ability: 'Abilities',
+		egggroup: 'Egg group',
+		category: 'Category'
+	};
+	Search.prototype.find = function (query) {
+		query = toId(query);
+
+		if (query === this.q) {
+			return false;
+		}
+		this.q = query;
+		this.resultSet = null;
+		this.exactMatch = false;
+		var qType = this.qType;
+
+		if (!query) {
+			// search field is blank, display default results
+
+			if (!this.filters && !this.sortCol && this.defaultResultSet) {
+				this.renderedIndex = 0;
+				this.renderingDone = false;
+				this.updateScroll();
+				return true;
+			}
+			if (qType === 'pokemon') {
+				this.allPokemon();
+				return true;
+			} else if (qType === 'move') {
+				this.allMoves();
+				return true;
+			}
+			this.el.innerHTML = '';
+			return true;
+		}
+
+		// If qType exists, we're searching mainly for results of that type.
+		// We'll still search for results of other types, but those results
+		// will only be used to filter results for that type.
+		var qTypeIndex = (qType ? typeTable[qType] : -1);
+
+		var qFilterType = '';
+		if (query.slice(-4) === 'type') {
+			if ((query.charAt(0).toUpperCase() + query.slice(1, -4)) in window.BattleTypeChart) {
+				query = query.slice(0, -4);
+				qFilterType = 'type';
+			}
+		}
+
+		// i represents the location of the search index we're looking
+		var i = Search.getClosest(query);
+		this.exactMatch = (BattleSearchIndex[i][0] === query);
+
+		// Even with output buffer buckets, we make multiple passes through
+		// the search index. searchPasses is a queue of which pass we're on:
+		// [passType, i, query]
+
+		// pass types:
+		// 0 - no pass: time to pop the next pass off the searchPasses queue
+		// 1 - normal pass: start at i and stop when results no longer start with query
+		// 2 - alias pass: like normal, but output aliases instead of non-alias results
+		// 3 - fuzzy match pass: start at i and stop when you have two results
+
+		// By doing an alias pass after the normal pass, we ensure that
+		// mid-word matches only display after start matches.
+		var passType = 0;
+		var searchPasses = [[1, i, query]];
+
+		// For performance reasons, only do an alias pass if query is at
+		// least 2 chars long
+		if (query.length > 1) searchPasses.push([2, i, query]);
+
+		// If the query matches an official alias in BattleAliases: These are
+		// different from the aliases in the search index and are given
+		// higher priority. We'll do a normal pass through the index with
+		// the alias text before any other passes.
+		var queryAlias;
+		if (query in BattleAliases) {
+			if (toId(BattleAliases[query]).slice(0, query.length) !== query) {
+				queryAlias = toId(BattleAliases[query]);
+				if (queryAlias.slice(0, 11) !== 'hiddenpower') {
+					searchPasses.unshift([1, Search.getClosest(queryAlias), queryAlias]);
+				}
+			}
+			this.exactMatch = true;
+		}
+
+		// If there are no matches starting with query: Do a fuzzy match pass
+		// Fuzzy matches will still be shown after alias matches
+		if (!this.exactMatch && BattleSearchIndex[i][0].substr(0, query.length) !== query) {
+			// No results start with this. Do a fuzzy match pass.
+			var matchLength = query.length - 1;
+			if (!i) i++;
+			while (matchLength &&
+				BattleSearchIndex[i][0].substr(0, matchLength) !== query.substr(0, matchLength) &&
+				BattleSearchIndex[i - 1][0].substr(0, matchLength) !== query.substr(0, matchLength)) {
+				matchLength--;
+			}
+			var matchQuery = query.substr(0, matchLength);
+			while (i >= 1 && BattleSearchIndex[i - 1][0].substr(0, matchLength) === matchQuery) i--;
+			searchPasses.push([3, i, '']);
+		}
+
+		// We split the output buffers into 8 buckets.
+		// Bucket 0 is usually unused, and buckets 1-7 represent
+		// pokemon, types, moves, etc (see typeTable).
+
+		// When we're done, the buffers are concatenated together to form
+		// our resultSet, with each buffer getting its own header, unlike
+		// multiple-pass results, which have no header.
+
+		// Notes:
+		// - if we have a qType, that qType's buffer will be on top
+		var bufs = [[], [], [], [], [], [], [], [], []];
+		var topbufIndex = -1;
+
+		var count = 0;
+		var nearMatch = false;
+
+		var instafilter = null;
+		var instafilterSort = [0, 1, 2, 5, 4, 3, 6, 7, 8];
+
+		// We aren't actually looping through the entirety of the searchIndex
+		for (i = 0; i < BattleSearchIndex.length; i++) {
+			if (!passType) {
+				var searchPass = searchPasses.shift();
+				if (!searchPass) break;
+				passType = searchPass[0];
+				i = searchPass[1];
+				query = searchPass[2];
+			}
+
+			var entry = BattleSearchIndex[i];
+			var id = entry[0];
+			var type = entry[1];
+
+			if (!id) break;
+
+			if (passType === 3) {
+				// fuzzy match pass; stop after 2 results
+				if (count >= 2) {
+					passType = 0;
+					continue;
+				}
+				nearMatch = true;
+			} else if (id.substr(0, query.length) !== query) {
+				// regular pass, time to move onto our next match
+				passType = 0;
+				continue;
+			}
+
+			if (entry.length > 2) {
+				// alias entry
+				if (passType !== 2) continue;
+			} else {
+				// normal entry
+				if (passType === 2) continue;
+			}
+
+			var typeIndex = typeTable[type];
+
+			// For performance, with a query length of 1, we only fill the first bucket
+			if (query.length === 1 && typeIndex !== (qType ? qTypeIndex : 1)) continue;
+
+			// For pokemon queries, accept types/tier/abilities/moves/eggroups as filters
+			if (qType === 'pokemon' && (typeIndex === 5 || typeIndex > 7)) continue;
+			if (qType === 'pokemon' && typeIndex === 3 && this.gen < 6) continue;
+			// For move queries, accept types/categories as filters
+			if (qType === 'move' && ((typeIndex !== 8 && typeIndex > 4) || typeIndex === 3)) continue;
+			// For move queries in the teambuilder, don't accept pokemon as filters
+			if (qType === 'move' && this.legalityFilter && typeIndex === 1) continue;
+			// For ability/item queries, don't accept anything else as a filter
+			if ((qType === 'ability' || qType === 'item') && typeIndex !== qTypeIndex) continue;
+			// Query was a type name followed 'type'; only show types
+			if (qFilterType === 'type' && typeIndex !== 2) continue;
+
+			var matchStart = 0;
+			var matchLength = 0;
+			if (passType === 2) {
+				// alias entry
+				// [aliasid, type, originalid, matchStart, originalindex]
+				matchStart = entry[3];
+				var originalIndex = entry[2];
+				if (matchStart) {
+					matchLength = matchStart + query.length;
+					matchStart += (BattleSearchIndexOffset[originalIndex][matchStart] || '0').charCodeAt(0) - 48;
+					matchLength += (BattleSearchIndexOffset[originalIndex][matchLength - 1] || '0').charCodeAt(0) - 48 - matchStart;
+				}
+				id = BattleSearchIndex[originalIndex][0];
+			} else {
+				matchLength = query.length;
+				if (matchLength) matchLength += (BattleSearchIndexOffset[i][matchLength - 1] || '0').charCodeAt(0) - 48;
+			}
+
+			// some aliases are substrings
+			if (queryAlias === id && query !== id) continue;
+
+			if (qType && qTypeIndex !== typeIndex) {
+				// This is a filter, set it as an instafilter candidate
+				if (!instafilter || instafilterSort[typeIndex] < instafilterSort[instafilter[2]]) {
+					instafilter = [type, id, typeIndex];
+				}
+			}
+
+			if (this.legalityFilter && typeIndex === qTypeIndex) {
+				// Always show illegal results under legal results.
+				// This is done by putting legal results (and the type header)
+				// in bucket 0, and illegal results in the qType's bucket.
+				// qType buckets are always on top (but under bucket 0), so
+				// illegal results will be seamlessly right under legal results.
+				if (!bufs[typeIndex].length && !bufs[0].length) bufs[0] = [['header', typeName[type]]];
+				if (id in this.legalityFilter) typeIndex = 0;
+			} else {
+				if (!bufs[typeIndex].length) bufs[typeIndex] = [['header', typeName[type]]];
+			}
+
+			bufs[typeIndex].push([type, id, matchStart, matchLength]);
+
+			count++;
+		}
+
+		var topbuf = [];
+		if (nearMatch) topbuf = [['html', '<p><em>No exact match found. The closest matches alphabetically are:</em></p></li>']];
+		if (this.filters) {
+			topbuf.push(['html', this.getFilterText(1)]);
+		}
+		if (qTypeIndex >= 0) {
+			topbuf = topbuf.concat(bufs[0]);
+			topbuf = topbuf.concat(bufs[qTypeIndex]);
+			bufs[qTypeIndex] = [];
+			bufs[0] = [];
+		} else if (topbufIndex >= 0) {
+			topbuf = topbuf.concat(bufs[topbufIndex]);
+			bufs[topbufIndex] = [];
+		}
+		if (query === 'grass' || query === 'flying') {
+			topbuf = topbuf.concat(bufs[5]);
+			bufs[5] = [];
+		}
+
+		if (instafilter && count < 20) {
+			// There's exactly one filter matched and count is less than 20, instafilter
+			bufs.push(this.instafilter(qType, instafilter[0], instafilter[1]));
+		}
+
+		this.resultSet = Array.prototype.concat.apply(topbuf, bufs);
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.updateScroll();
+		return true;
+	};
+	Search.prototype.instafilter = function (qType, fType, fId) {
+		var buf = [];
+		var illegalBuf = [];
+		var legal = this.legalityFilter;
+		if (qType === 'pokemon') {
+			switch (fType) {
+			case 'type':
+				var type = fId.charAt(0).toUpperCase() + fId.slice(1);
+				buf.push(['header', "" + type + "-type Pok&eacute;mon"]);
+				for (var id in BattlePokedex) {
+					if (!BattlePokedex[id].types) continue;
+					if (BattlePokedex[id].types[0] === type || BattlePokedex[id].types[1] === type) {
+						(legal && !(id in legal) ? illegalBuf : buf).push(['pokemon', id]);
+					}
+				}
+				break;
+			case 'ability':
+				var ability = Tools.getAbility(fId).name;
+				buf.push(['header', "" + ability + " Pok&eacute;mon"]);
+				for (var id in BattlePokedex) {
+					if (!BattlePokedex[id].abilities) continue;
+					if (BattlePokedex[id].abilities['0'] === ability || BattlePokedex[id].abilities['1'] === ability || BattlePokedex[id].abilities['H'] === ability) {
+						(legal && !(id in legal) ? illegalBuf : buf).push(['pokemon', id]);
+					}
+				}
+				break;
+			}
+		} else if (qType === 'move') {
+			switch (fType) {
+			case 'type':
+				var type = fId.charAt(0).toUpperCase() + fId.slice(1);
+				buf.push(['header', "" + type + "-type moves"]);
+				for (var id in BattleMovedex) {
+					if (BattleMovedex[id].type === type) {
+						(legal && !(id in legal) ? illegalBuf : buf).push(['move', id]);
+					}
+				}
+				break;
+			case 'category':
+				var category = fId.charAt(0).toUpperCase() + fId.slice(1);
+				buf.push(['header', "" + category + " moves"]);
+				for (var id in BattleMovedex) {
+					if (BattleMovedex[id].category === category) {
+						(legal && !(id in legal) ? illegalBuf : buf).push(['move', id]);
+					}
+				}
+				break;
+			}
+		}
+		return buf.concat(illegalBuf);
+	};
+	Search.prototype.addFilter = function (node) {
+		if (!node.dataset.entry) return;
+		var entry = node.dataset.entry.split(':');
+		if (this.qType === 'pokemon') {
+			if (entry[0] === this.sortCol) this.sortCol = null;
+			if (entry[0] !== 'type' && entry[0] !== 'move' && entry[0] !== 'ability' && entry[0] !== 'egggroup' && entry[0] !== 'tier') return;
+			if (entry[0] === 'move') entry[1] = toId(entry[1]);
+			if (!this.filters) this.filters = [];
+			this.q = undefined;
+			for (var i = 0; i < this.filters.length; i++) {
+				if (this.filters[i][0] === entry[0] && this.filters[i][1] === entry[1]) {
+					return true;
+				}
+			}
+			this.filters.push(entry);
+			return true;
+		} else if (this.qType === 'move') {
+			if (entry[0] !== 'type' && entry[0] !== 'category' && entry[0] !== 'pokemon') return;
+			if (entry[0] === 'pokemon') entry[1] = toId(entry[1]);
+			if (!this.filters) this.filters = [];
+			this.filters.push(entry);
+			this.q = undefined;
+			return true;
+		}
+	};
+	Search.prototype.removeFilter = function () {
+		if (!this.filters) return;
+		this.filters.pop();
+		if (!this.filters.length) this.filters = null;
+		this.q = undefined;
+		return true;
+	};
+	Search.prototype.allPokemon = function () {
+		if (this.filters || this.sortCol) return this.filteredPokemon();
+		var resultSet = [['sortpokemon', '']];
+		for (var id in BattlePokedex) {
+			switch (id) {
+			case 'bulbasaur':
+				resultSet.push(['header', "Generation 1"]);
+				break;
+			case 'chikorita':
+				resultSet.push(['header', "Generation 2"]);
+				break;
+			case 'treecko':
+				resultSet.push(['header', "Generation 3"]);
+				break;
+			case 'turtwig':
+				resultSet.push(['header', "Generation 4"]);
+				break;
+			case 'victini':
+				resultSet.push(['header', "Generation 5"]);
+				break;
+			case 'chespin':
+				resultSet.push(['header', "Generation 6"]);
+				break;
+			case 'missingno':
+				resultSet.push(['header', "Glitch"]);
+				break;
+			case 'tomohawk':
+				resultSet.push(['header', "CAP"]);
+				break;
+			case 'pikachucosplay':
+				continue;
+			}
+			resultSet.push(['pokemon', id]);
+		}
+		this.resultSet = resultSet;
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.updateScroll();
+	};
+	Search.prototype.allMoves = function () {
+		if (this.filters) return this.filteredMoves();
+		var resultSet = [];
+		resultSet.push(['header', "Moves"]);
+		for (var id in BattleMovedex) {
+			switch (id) {
+			case 'paleowave':
+				resultSet.push(['header', "CAP moves"]);
+				break;
+			case 'magikarpsrevenge':
+				continue;
+			}
+			resultSet.push(['move', id]);
+		}
+		this.resultSet = resultSet;
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.updateScroll();
+	};
+	Search.prototype.allTypes = function (resultSet) {
+		if (!resultSet) resultSet = [];
+		for (var id in window.BattleTypeChart) {
+			resultSet.push(['type', id]);
+		}
+		this.resultSet = resultSet;
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.updateScroll();
+	};
+	Search.prototype.allAbilities = function (resultSet) {
+		if (!resultSet) resultSet = [];
+		for (var id in BattleAbilities) {
+			resultSet.push(['ability', id]);
+		}
+		this.resultSet = resultSet;
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.updateScroll();
+	};
+	Search.prototype.getFilterText = function (q) {
+		var buf = '<p>Filters: ';
+		for (var i = 0; i < this.filters.length; i++) {
+			var text = this.filters[i][1];
+			if (this.filters[i][0] === 'move') text = Tools.getMove(text).name;
+			if (this.filters[i][0] === 'pokemon') text = Tools.getTemplate(text).name;
+			buf += '<button class="filter" value="' + Tools.escapeHTML(this.filters[i].join(':')) + '">' + text + ' <i class="fa fa-times-circle"></i></button> ';
+		}
+		if (!q) buf += '<small style="color: #888">(backspace = delete filter)</small>';
+		return buf + '</p>';
+	};
+	Search.prototype.filteredPokemon = function () {
+		var resultSet = [];
+		var filters = this.filters || [];
+		var sortCol = this.sortCol;
+
+		this.resultSet = [['sortpokemon', '']];
+		if (filters.length) this.resultSet.push(['html', this.getFilterText()], ['header', "Filtered results"]);
+		if (sortCol === 'type') {
+			return this.allTypes(this.resultSet);
+		} else if (sortCol === 'ability') {
+			return this.allAbilities(this.resultSet);
+		}
+
+		var illegalResultSet = [];
+		var genChar = '' + this.gen;
+		for (var id in BattlePokedex) {
+			var template = BattlePokedex[id];
+			if (template.exists === false) continue;
+			for (var i = 0; i < filters.length; i++) {
+				if (filters[i][0] === 'type') {
+					var type = filters[i][1];
+					if (template.types[0] !== type && template.types[1] !== type) break;
+				} else if (filters[i][0] === 'egggroup') {
+					var egggroup = filters[i][1];
+					if (!template.eggGroups) continue;
+					if (template.eggGroups[0] !== egggroup && template.eggGroups[1] !== egggroup) break;
+				} else if (filters[i][0] === 'tier') {
+					var tier = filters[i][1];
+					if (template.tier !== tier) break;
+				} else if (filters[i][0] === 'ability') {
+					var ability = filters[i][1];
+					if (template.abilities['0'] !== ability && template.abilities['1'] !== ability && template.abilities['H'] !== ability) break;
+				} else if (filters[i][0] === 'move') {
+					var learned = false;
+					var learnsetid = id;
+					if (!(learnsetid in BattleTeambuilderTable.learnsets)) {
+						learnsetid = toId(BattlePokedex[learnsetid].baseSpecies);
+					}
+					while (true) {
+						var learnset = BattleTeambuilderTable.learnsets[learnsetid];
+						if (learnset && (filters[i][1] in learnset) && learnset[filters[i][1]].indexOf(genChar) >= 0) {
+							learned = true;
+							break;
+						}
+						var prevo = BattlePokedex[learnsetid].prevo;
+						if (!prevo) break;
+						learnsetid = prevo;
+					}
+					if (!learned) break;
+				}
+			}
+			if (i < filters.length) continue;
+			if (this.legalityFilter && !(id in this.legalityFilter)) {
+				if (!sortCol) illegalResultSet.push(['pokemon', id]);
+			} else {
+				resultSet.push(['pokemon', id]);
+			}
+		}
+		if (sortCol === 'hp' || sortCol === 'atk' || sortCol === 'def' || sortCol === 'spa' || sortCol === 'spd' || sortCol === 'spe') {
+			resultSet = resultSet.sort(function (row1, row2) {
+				var stat1 = BattlePokedex[row1[1]].baseStats[sortCol];
+				var stat2 = BattlePokedex[row2[1]].baseStats[sortCol];
+				return stat2 - stat1;
+			});
+		} else if (sortCol === 'bst') {
+			resultSet = resultSet.sort(function (row1, row2) {
+				var base1 = BattlePokedex[row1[1]].baseStats;
+				var base2 = BattlePokedex[row2[1]].baseStats;
+				var bst1 = base1.hp + base1.atk + base1.def + base1.spa + base1.spd + base1.spe;
+				var bst2 = base2.hp + base2.atk + base2.def + base2.spa + base2.spd + base2.spe;
+				return bst2 - bst1;
+			});
+		} else if (sortCol === 'name') {
+			resultSet = resultSet.sort(function (row1, row2) {
+				var name1 = row1[1];
+				var name2 = row2[1];
+				return name1 < name2 ? -1 : name1 > name2 ? 1 : 0;
+			});
+		}
+		this.resultSet = this.resultSet.concat(resultSet, illegalResultSet);
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.updateScroll();
+	};
+	Search.prototype.filteredMoves = function () {
+		var resultSet = [['html', this.getFilterText()]];
+		resultSet.push(['header', "Filtered results"]);
+		var illegalResultSet = [];
+		var filters = this.filters;
+		for (var id in BattleMovedex) {
+			var move = BattleMovedex[id];
+			if (move.exists === false) continue;
+			for (var i = 0; i < filters.length; i++) {
+				if (filters[i][0] === 'type') {
+					if (move.type !== filters[i][1]) break;
+				} else if (filters[i][0] === 'category') {
+					if (move.category !== filters[i][1]) break;
+				} else if (filters[i][0] === 'pokemon') {
+					var learned = false;
+					var learnsetid = filters[i][1];
+					if (!(learnsetid in BattleTeambuilderTable.learnsets[learnsetid])) {
+						learnsetid = toId(BattlePokedex[learnsetid].baseSpecies);
+					}
+					while (true) {
+						var learnset = BattleTeambuilderTable.learnsets[learnsetid];
+						if (learnset && (id in learnset)) {
+							learned = true;
+							break;
+						}
+						var prevo = BattlePokedex[learnsetid].prevo;
+						if (!prevo) break;
+						learnsetid = prevo;
+					}
+					if (!learned) break;
+				}
+			}
+			if (i < filters.length) continue;
+			if (this.legalityFilter && !(id in this.legalityFilter)) {
+				illegalResultSet.push(['move', id]);
+			} else {
+				resultSet.push(['move', id]);
+			}
+		}
+		this.resultSet = resultSet.concat(illegalResultSet);
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.updateScroll();
+	};
+	Search.prototype.updateScroll = function (forceAdd) {
+		if (this.renderingDone) return;
+		var top = this.$viewport.scrollTop();
+		var bottom = top + this.$viewport.height();
+		var windowHeight = $(window).height();
+		var i = this.renderedIndex;
+		var finalIndex = Math.floor(bottom / 33) + 1;
+		if (!forceAdd && finalIndex <= i) return;
+		if (finalIndex < i + 20) finalIndex = i + 20;
+		if (bottom - top > windowHeight && !i) finalIndex = 20;
+		if (forceAdd && finalIndex > i + 40) finalIndex = i + 40;
+
+		var resultSet = this.resultSet || this.defaultResultSet;
+		var buf = '';
+		while (i < finalIndex) {
+			if (!resultSet[i]) {
+				this.renderingDone = true;
+				break;
+			}
+			var row = resultSet[i];
+
+			var errorMessage = '';
+			if (this.qType && row[0] !== 'header' && row[0] !== 'html' && this.qType !== row[0]) {
+				errorMessage = '<span class="col filtercol"><em>Filter</em></span>';
+			} else if (this.legalityFilter && !(row[1] in this.legalityFilter)) {
+				errorMessage = '<span class="col illegalcol"><em>' + this.legalityLabel + '</em></span>';
+			}
+
+			var mStart = 0;
+			var mEnd = 0;
+			if (row.length > 3) {
+				mStart = row[2];
+				mEnd = row[3];
+			}
+			buf += this.renderRow(row[1], row[0], mStart, mEnd, errorMessage, row[1] in this.cur ? ' class="cur"' : '');
+
+			i++;
+		}
+		if (!this.renderedIndex) {
+			this.el.innerHTML = '<ul class="utilichart" style="height:' + (resultSet.length * 33) + 'px">' + buf + (!this.renderingDone ? '<li class="result more"><p><button class="button big">More</button></p></li>' : '') + '</ul>';
+			this.moreVisible = true;
+		} else {
+			if (this.moreVisible) {
+				this.$el.find('.more').remove();
+				if (!forceAdd) this.moreVisible = false;
+			}
+			$(this.el.firstChild).append(buf + (forceAdd && !this.renderingDone ? '<li class="result more"><p><button class="button big">More</button></p></li>' : ''));
+		}
+		this.renderedIndex = i;
+	};
+	Search.prototype.setType = function (qType, format, set, cur) {
+		if (!format) format = '';
+		if (this.qType !== qType) {
+			this.filters = null;
+			this.sortCol = null;
+		}
+		this.qType = qType;
+		this.q = undefined;
+		this.cur = cur || {};
+		this.legalityFilter = {};
+		this.legalityLabel = "Illegal";
+		this.gen = 6;
+		if (format.slice(0, 3) === 'gen') {
+			this.gen = (Number(format.charAt(3)) || 6);
+			format = format.slice(4);
+		}
+		var requirePentagon = (format === 'vgc2016');
+		var template;
+		this.resultSet = null;
+		this.defaultResultSet = null;
+
+		switch (qType) {
+		case 'pokemon':
+			var table = BattleTeambuilderTable;
+			var isDoubles = false;
+			if (this.gen < 6) table = table['gen' + this.gen];
+			if (this.gen >= 6 && format.indexOf('doubles') >= 0 || format.indexOf('vgc') >= 0 || format.indexOf('triples') >= 0) {
+				table = table['doubles'];
+				isDoubles = true;
+			}
+			if (!table.tierSet) {
+				table.tierSet = table.tiers.map(function (r) {
+					if (typeof r === 'string') return ['pokemon', r];
+					return [r[0], r[1]];
+				});
+				table.tiers = null;
+			}
+			var tierSet = table.tierSet;
+			var slices = table.formatSlices;
+			var agTierSet = [];
+			if (this.gen >= 6) agTierSet = [['header', "AG"], ['pokemon', 'rayquazamega']];
+			if (format === 'ubers' || format === 'uber') tierSet = tierSet.slice(slices.Uber);
+			else if (format === 'ou') tierSet = tierSet.slice(slices.OU);
+			else if (format === 'uu') tierSet = tierSet.slice(slices.UU);
+			else if (format === 'ru') tierSet = tierSet.slice(slices.RU);
+			else if (format === 'nu') tierSet = tierSet.slice(slices.NU);
+			else if (format === 'pu') tierSet = tierSet.slice(slices.PU);
+			else if (format === 'lc' || format === 'lcuu') tierSet = tierSet.slice(slices.LC);
+			else if (format === 'cap') tierSet = tierSet.slice(0, slices.Uber).concat(tierSet.slice(slices.OU));
+			else if (format === 'anythinggoes' || format === 'ag') tierSet = agTierSet.concat(tierSet.slice(slices.Uber));
+			else if (format === 'balancedhackmons' || format === 'bh') tierSet = agTierSet.concat(tierSet.slice(slices.Uber));
+			else if (format === 'doublesou') tierSet = tierSet.slice(slices.DOU);
+			else if (format === 'doublesuu') tierSet = tierSet.slice(slices.DUU);
+			else if (format === 'doublesnu') tierSet = tierSet.slice(slices.DNU);
+			// else if (isDoubles) tierSet = tierSet;
+			else if (!isDoubles) tierSet = tierSet.slice(slices.OU, slices.UU).concat(agTierSet).concat(tierSet.slice(slices.Uber, slices.OU)).concat(tierSet.slice(slices.UU));
+
+			if (format === 'vgc2016') {
+				tierSet = tierSet.filter(function (r) {
+					var banned = {deoxys:1, deoxysattack:1, deoxysdefense:1, deoxysspeed:1, mew:1, celebi:1, shaymin:1, shayminsky:1, darkrai:1, victini:1, keldeo:1, keldeoresolute:1, meloetta:1, arceus:1, genesect:1, jirachi:1, manaphy:1, phione:1, hoopa:1, hoopaunbound:1, diancie:1, dianciemega:1};
+					if (r[1] in banned || r[1].substr(0, 6) === 'arceus') return false;
+					return true;
+				});
+			}
+
+			this.defaultResultSet = tierSet;
+			this.legalityLabel = "Banned";
+			break;
+
+		case 'item':
+			var table = BattleTeambuilderTable;
+			if (this.gen < 6) table = table['gen' + this.gen];
+			if (!table.itemSet) {
+				table.itemSet = table.items.map(function (r) {
+					if (typeof r === 'string') return ['item', r];
+					return [r[0], r[1]];
+				});
+				table.items = null;
+			}
+			this.defaultResultSet = table.itemSet;
+			break;
+
+		case 'ability':
+			template = Tools.getTemplate(set.species);
+			var abilitySet = [['header', "Abilities"]];
+			if (template.isMega) {
+				abilitySet.unshift(['html', '<p>Will be <strong>' + Tools.escapeHTML(template.abilities['0']) + '</strong> after Mega Evolving.</p>']);
+				template = Tools.getTemplate(template.baseSpecies);
+			}
+			abilitySet.push(['ability', toId(template.abilities['0'])]);
+			if (template.abilities['1'] && Tools.getAbility(template.abilities['1']).gen <= this.gen) {
+				abilitySet.push(['ability', toId(template.abilities['1'])]);
+			}
+			if (template.abilities['H'] && this.gen >= 5) {
+				abilitySet.push(['header', "Hidden Ability"]);
+				abilitySet.push(['ability', toId(template.abilities['H'])]);
+			}
+			this.defaultResultSet = abilitySet;
+			break;
+
+		case 'move':
+			template = Tools.getTemplate(set.species);
+			if (!(template.id in BattleTeambuilderTable.learnsets) || template.form) {
+				template = Tools.getTemplate(template.baseSpecies);
+			}
+			var moves = [];
+			var sketch = false;
+			var gen = '' + this.gen;
+			while (true) {
+				var learnset = BattleTeambuilderTable.learnsets[toId(template.species)];
+				if (learnset) {
+					for (var moveid in learnset) {
+						var learnsetEntry = learnset[moveid];
+						if (requirePentagon && learnsetEntry.indexOf('p') < 0) {
+							continue;
+						} else if (learnsetEntry.indexOf(gen) < 0) {
+							continue;
+						}
+						if (moves.indexOf(moveid) >= 0) continue;
+						moves.push(moveid);
+						if (moveid === 'sketch') sketch = true;
+						if (moveid === 'hiddenpower') {
+							moves.push('hiddenpowerbug', 'hiddenpowerdark', 'hiddenpowerdragon', 'hiddenpowerelectric', 'hiddenpowerfighting', 'hiddenpowerfire', 'hiddenpowerflying', 'hiddenpowerghost', 'hiddenpowergrass', 'hiddenpowerground', 'hiddenpowerice', 'hiddenpowerpoison', 'hiddenpowerpsychic', 'hiddenpowerrock', 'hiddenpowersteel', 'hiddenpowerwater');
+						}
+					}
+				}
+				if (template.baseSpecies !== template.species && template.baseSpecies in {Rotom:1, Pumpkaboo:1}) {
+					template = BattlePokedex[toId(template.baseSpecies)];
+				} else if (template.prevo) {
+					template = BattlePokedex[template.prevo];
+				} else {
+					break;
+				}
+			}
+			if (sketch) {
+				moves = [];
+				for (var i in BattleMovedex) {
+					if (i === 'chatter' || i === 'magikarpsrevenge' || i === 'paleowave' || i === 'shadowstrike') continue;
+					moves.push(i);
+				}
+			}
+
+			moves.sort();
+
+			var usableMoves = [];
+			var uselessMoves = [];
+			for (var i = 0; i < moves.length; i++) {
+				var id = moves[i];
+				var isViable = BattleMovedex[id] && BattleMovedex[id].isViable;
+				if (id === 'aerialace') isViable = (toId(set.ability) === 'technician');
+				if (id === 'bellydrum') isViable = (toId(set.species) in {azumarill:1, linoone:1, slurpuff:1});
+				if (id === 'clamp' || id === 'hyperbeam' || id === 'wrap') isViable = (this.gen === 1);
+				if (id === 'counter') isViable = (toId(set.species) in {chansey:1, skarmory:1, clefable:1, wobbuffet:1});
+				if (id === 'dynamicpunch') isViable = (toId(set.ability) === 'noguard');
+				if (id === 'focuspunch') isViable = (toId(set.species) === 'breloom');
+				if (id === 'gyroball') isViable = (template.baseStats.spe <= 60);
+				if (id === 'hiddenpowerelectric') isViable = (moves.indexOf('thunderbolt') < 0);
+				if (id === 'hiddenpowerfighting') isViable = (moves.indexOf('aurasphere') < 0 && moves.indexOf('focusblast') < 0);
+				if (id === 'hiddenpowerfire') isViable = (moves.indexOf('flamethrower') < 0);
+				if (id === 'hiddenpowergrass') isViable = (moves.indexOf('energyball') < 0 && moves.indexOf('gigadrain') < 0);
+				if (id === 'hiddenpowerice') isViable = (moves.indexOf('icebeam') < 0 && template.id !== 'xerneas');
+				if (id === 'icywind') isViable = (toId(set.species).substr(0, 6) === 'keldeo');
+				if (id === 'reflecttype') isViable = (toId(set.species) in {latias:1, starmie:1});
+				if (id === 'selfdestruct') isViable = (this.gen < 5 && moves.indexOf('explosion') < 0);
+				if (id === 'skyattack') isViable = (toId(set.species) === 'hawlucha');
+				if (id === 'stunspore') isViable = (moves.indexOf('thunderwave') < 0);
+				if (id === 'toxic') isViable = (this.gen > 1);
+				if (isViable) {
+					if (!usableMoves.length) usableMoves.push(['header', "Moves"]);
+					usableMoves.push(['move', id]);
+				} else {
+					if (!uselessMoves.length) uselessMoves.push(['header', "Usually useless moves"]);
+					uselessMoves.push(['move', id]);
+				}
+			}
+			this.defaultResultSet = usableMoves.concat(uselessMoves);
+			break;
+		}
+
+		for (var i in cur) {
+			if (i) this.defaultResultSet = [[qType, i]].concat(this.defaultResultSet);
+			break;
+		}
+		if (qType === 'pokemon') this.defaultResultSet = [['sortpokemon', '']].concat(this.defaultResultSet);
+
+		if (this.legalityFilter) {
+			for (var i = 0; i < this.defaultResultSet.length; i++) {
+				if (this.defaultResultSet[i][0] !== 'header') {
+					this.legalityFilter[this.defaultResultSet[i][1]] = 1;
+				}
+			}
+		}
+
+		this.renderedIndex = 0;
+		this.renderingDone = false;
+		this.find('');
+	};
+
+	Search.getClosest = function (query) {
+		// binary search through the index!
+		var left = 0;
+		var right = BattleSearchIndex.length - 1;
+		while (right > left) {
+			var mid = Math.floor((right - left) / 2 + left);
+			if (BattleSearchIndex[mid][0] === query && (mid === 0 || BattleSearchIndex[mid - 1][0] !== query)) {
+				// that's us
+				return mid;
+			} else if (BattleSearchIndex[mid][0] < query) {
+				left = mid + 1;
+			} else {
+				right = mid - 1;
+			}
+		}
+		if (left >= BattleSearchIndex.length - 1) left = BattleSearchIndex.length - 1;
+		else if (BattleSearchIndex[left + 1][0] && BattleSearchIndex[left][0] < query) left++;
+		if (left && BattleSearchIndex[left - 1][0] === query) left--;
+		return left;
+	};
+
+/*********************************************************
+ * Rendering functions
+ *********************************************************/
+
+	// These all have static versions
+
+	Search.prototype.renderRow = function (id, type, matchStart, matchLength, errorMessage, attrs) {
+		// errorMessage = '<span class="col illegalcol"><em>' + errorMessage + '</em></span>';
+		switch (type) {
+		case 'html':
+			return '<li class="result">' + id + '</li>';
+		case 'header':
+			return '<li class="result"><h3>' + id + '</h3></li>';
+		case 'sortpokemon':
+			return this.renderPokemonSortRow();
+		case 'pokemon':
+			var pokemon = BattlePokedex[id];
+			if (!pokemon) pokemon = BattlePokedex[toId(Tools.getTemplate(id).baseSpecies)];
+			return this.renderPokemonRow(pokemon, matchStart, matchLength, errorMessage, attrs);
+		case 'move':
+			var move = BattleMovedex[id];
+			return this.renderMoveRow(move, matchStart, matchLength, errorMessage, attrs);
+		case 'item':
+			var item = BattleItems[id];
+			return this.renderItemRow(item, matchStart, matchLength, errorMessage, attrs);
+		case 'ability':
+			var ability = BattleAbilities[id];
+			return this.renderAbilityRow(ability, matchStart, matchLength, errorMessage, attrs);
+		case 'type':
+			var type = {name: id[0].toUpperCase() + id.substr(1)};
+			return this.renderTypeRow(type, matchStart, matchLength, errorMessage);
+		case 'egggroup':
+			// very hardcode
+			var egName;
+			if (id === 'humanlike') egName = 'Human-Like';
+			else if (id === 'water1') egName = 'Water 1';
+			else if (id === 'water2') egName = 'Water 2';
+			else if (id === 'water3') egName = 'Water 3';
+			if (egName) {
+				if (matchLength > 5) matchLength++;
+			} else {
+				egName = id[0].toUpperCase() + id.substr(1);
+			}
+			var egggroup = {name: egName};
+			return this.renderEggGroupRow(egggroup, matchStart, matchLength, errorMessage);
+		case 'tier':
+			// very hardcode
+			var tierTable = {
+				uber: "Uber",
+				ou: "OU",
+				uu: "UU",
+				ru: "RU",
+				nu: "NU",
+				pu: "PU",
+				nfe: "NFE",
+				lcuber: "LC Uber",
+				lc: "LC",
+				cap: "CAP",
+				bl: "BL",
+				bl2: "BL2",
+				bl3: "BL3",
+				bl4: "BL4"
+			};
+			var tier = {name: tierTable[id]};
+			return this.renderTierRow(tier, matchStart, matchLength, errorMessage);
+		case 'category':
+			var category = {name: id[0].toUpperCase() + id.substr(1)};
+			return this.renderCategoryRow(category, matchStart, matchLength, errorMessage);
+		}
+		return 'Error: not found';
+	};
+	Search.prototype.renderPokemonSortRow = function () {
+		var buf = '<li class="result"><div class="sortrow">';
+		buf += '<button class="sortcol numsortcol">' + (this.defaultResultSet && !this.filters ? 'Tier' : 'Number') + '</button>';
+		buf += '<button class="sortcol pnamesortcol' + (this.sortCol === 'name' ? ' cur' : '') + '" data-sort="name">Name</button>';
+		buf += '<button class="sortcol typesortcol' + (this.sortCol === 'type' ? ' cur' : '') + '" data-sort="type">Types</button>';
+		buf += '<button class="sortcol abilitysortcol' + (this.sortCol === 'ability' ? ' cur' : '') + '" data-sort="ability">Abilities</button>';
+		buf += '<button class="sortcol statsortcol' + (this.sortCol === 'hp' ? ' cur' : '') + '" data-sort="hp">HP</button>';
+		buf += '<button class="sortcol statsortcol' + (this.sortCol === 'atk' ? ' cur' : '') + '" data-sort="atk">Atk</button>';
+		buf += '<button class="sortcol statsortcol' + (this.sortCol === 'def' ? ' cur' : '') + '" data-sort="def">Def</button>';
+		buf += '<button class="sortcol statsortcol' + (this.sortCol === 'spa' ? ' cur' : '') + '" data-sort="spa">SpA</button>';
+		buf += '<button class="sortcol statsortcol' + (this.sortCol === 'spd' ? ' cur' : '') + '" data-sort="spd">SpD</button>';
+		buf += '<button class="sortcol statsortcol' + (this.sortCol === 'spe' ? ' cur' : '') + '" data-sort="spe">Spe</button>';
+		buf += '<button class="sortcol statsortcol' + (this.sortCol === 'bst' ? ' cur' : '') + '" data-sort="bst">BST</button>';
+		buf += '</div></li>';
+		return buf;
+	};
+	Search.prototype.renderPokemonRow = function (pokemon, matchStart, matchLength, errorMessage, attrs) {
+		if (!attrs) attrs = '';
+		var id = toId(pokemon.species);
+		if (Search.urlRoot) attrs += ' href="' + Search.urlRoot + 'pokemon/' + id + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="pokemon:' + Tools.escapeHTML(pokemon.species) + '">';
+
+		// number
+		// buf += '<span class="col numcol">' + (pokemon.num >= 0 ? pokemon.num : 'CAP') + '</span> ';
+		buf += '<span class="col numcol">' + (this.gen >= 6 ? pokemon.tier || Tools.getTemplate(pokemon.baseSpecies).tier : pokemon.num) + '</span> ';
+
+		// icon
+		buf += '<span class="col iconcol">';
+		buf += '<span style="' + Tools.getPokemonIcon(pokemon) + '"></span>';
+		buf += '</span> ';
+
+		// name
+		var name = pokemon.species;
+		var tagStart = (pokemon.forme ? name.length - pokemon.forme.length - 1 : 0);
+		if (tagStart) name = name.substr(0, tagStart);
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		if (tagStart) {
+			if (matchLength && matchStart + matchLength > tagStart) {
+				if (matchStart < tagStart) {
+					matchLength -= tagStart - matchStart;
+					matchStart = tagStart;
+				}
+				name += '<small>' + pokemon.species.substr(tagStart, matchStart - tagStart) + '<b>' + pokemon.species.substr(matchStart, matchLength) + '</b>' + pokemon.species.substr(matchStart + matchLength) + '</small>';
+			} else {
+				name += '<small>' + pokemon.species.substr(tagStart) + '</small>';
+			}
+		}
+		buf += '<span class="col pokemonnamecol" style="white-space:nowrap">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		// type
+		buf += '<span class="col typecol">';
+		var types = pokemon.types;
+		var gen = this.gen;
+		if (gen < 5 && pokemon.baseSpecies === 'Rotom') {
+			types = ["Electric", "Ghost"];
+		} else if (gen < 2 && types[1] === 'Steel') {
+			types = [types[0]];
+		} else if (gen < 6 && types[0] === 'Fairy' && types.length > 1) {
+			types = ['Normal', types[1]];
+		} else if (gen < 6 && types[0] === 'Fairy') {
+			types = ['Normal'];
+		} else if (gen < 6 && types[1] === 'Fairy') {
+			types = [types[0]];
+		}
+		for (var i = 0; i < types.length; i++) {
+			buf += Tools.getTypeIcon(types[i]);
+		}
+		buf += '</span> ';
+
+		// abilities
+		if (gen >= 3) {
+			if (pokemon.abilities['1']) {
+				buf += '<span class="col twoabilitycol">' + pokemon.abilities['0'] + '<br />' +
+					pokemon.abilities['1'] + '</span>';
+			} else {
+				buf += '<span class="col abilitycol">' + pokemon.abilities['0'] + '</span>';
+			}
+			if (gen >= 5) {
+				if (pokemon.abilities['H']) {
+					buf += '<span class="col abilitycol' + (pokemon.unreleasedHidden ? ' unreleasedhacol' : '') + '">' + pokemon.abilities['H'] + '</span>';
+				} else {
+					buf += '<span class="col abilitycol"></span>';
+				}
+			}
+		}
+
+		// base stats
+		var stats = pokemon.baseStats;
+		if (gen < 6) {
+			var overrideStats = BattleTeambuilderTable['gen' + gen].overrideStats[id];
+			if (overrideStats || gen === 1) {
+				stats = {
+					hp: pokemon.baseStats.hp,
+					atk: pokemon.baseStats.atk,
+					def: pokemon.baseStats.def,
+					spa: pokemon.baseStats.spa,
+					spd: pokemon.baseStats.spd,
+					spe: pokemon.baseStats.spe
+				};
+			}
+			if (overrideStats) {
+				if ('hp' in overrideStats) stats.hp = overrideStats.hp;
+				if ('atk' in overrideStats) stats.atk = overrideStats.atk;
+				if ('def' in overrideStats) stats.def = overrideStats.def;
+				if ('spa' in overrideStats) stats.spa = overrideStats.spa;
+				if ('spd' in overrideStats) stats.spd = overrideStats.spd;
+				if ('spe' in overrideStats) stats.spe = overrideStats.spe;
+			}
+			if (gen === 1) stats.spd = 0;
+		}
+		buf += '<span class="col statcol"><em>HP</em><br />' + stats.hp + '</span> ';
+		buf += '<span class="col statcol"><em>Atk</em><br />' + stats.atk + '</span> ';
+		buf += '<span class="col statcol"><em>Def</em><br />' + stats.def + '</span> ';
+		if (gen >= 2) {
+			buf += '<span class="col statcol"><em>SpA</em><br />' + stats.spa + '</span> ';
+			buf += '<span class="col statcol"><em>SpD</em><br />' + stats.spd + '</span> ';
+		} else {
+			buf += '<span class="col statcol"><em>Spc</em><br />' + stats.spa + '</span> ';
+		}
+		buf += '<span class="col statcol"><em>Spe</em><br />' + stats.spe + '</span> ';
+		var bst = 0;
+		for (i in stats) bst += stats[i];
+		buf += '<span class="col bstcol"><em>BST<br />' + bst + '</em></span> ';
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+	Search.prototype.renderTaggedPokemonRowInner = function (pokemon, tag, errorMessage) {
+		var attrs = '';
+		if (Search.urlRoot) attrs = ' href="' + Search.urlRoot + 'pokemon/' + toId(pokemon.species) + '" data-target="push"';
+		var buf = '<a' + attrs + ' data-entry="pokemon:' + Tools.escapeHTML(pokemon.species) + '">';
+
+		// tag
+		buf += '<span class="col tagcol shorttagcol">' + tag + '</span> ';
+
+		// icon
+		buf += '<span class="col iconcol">';
+		buf += '<span style="' + Tools.getPokemonIcon(pokemon) + '"></span>';
+		buf += '</span> ';
+
+		// name
+		var name = pokemon.species;
+		var tagStart = (pokemon.forme ? name.length - pokemon.forme.length - 1 : 0);
+		if (tagStart) name = name.substr(0, tagStart) + '<small>' + pokemon.species.substr(tagStart) + '</small>';
+		buf += '<span class="col shortpokemonnamecol" style="white-space:nowrap">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		// type
+		buf += '<span class="col typecol">';
+		for (var i = 0; i < pokemon.types.length; i++) {
+			buf += Tools.getTypeIcon(pokemon.types[i]);
+		}
+		buf += '</span> ';
+
+		// abilities
+		buf += '<span style="float:left;min-height:26px">';
+		if (pokemon.abilities['1']) {
+			buf += '<span class="col twoabilitycol">';
+		} else {
+			buf += '<span class="col abilitycol">';
+		}
+		for (var i in pokemon.abilities) {
+			var ability = pokemon.abilities[i];
+			if (!ability) continue;
+
+			if (i === '1') buf += '<br />';
+			if (i === 'H') ability = '</span><span class="col abilitycol"><em>' + pokemon.abilities[i] + '</em>';
+			buf += ability;
+		}
+		if (!pokemon.abilities['H']) buf += '</span><span class="col abilitycol">';
+		buf += '</span>';
+		buf += '</span>';
+
+		// base stats
+		buf += '<span style="float:left;min-height:26px">';
+		buf += '<span class="col statcol"><em>HP</em><br />' + pokemon.baseStats.hp + '</span> ';
+		buf += '<span class="col statcol"><em>Atk</em><br />' + pokemon.baseStats.atk + '</span> ';
+		buf += '<span class="col statcol"><em>Def</em><br />' + pokemon.baseStats.def + '</span> ';
+		buf += '<span class="col statcol"><em>SpA</em><br />' + pokemon.baseStats.spa + '</span> ';
+		buf += '<span class="col statcol"><em>SpD</em><br />' + pokemon.baseStats.spd + '</span> ';
+		buf += '<span class="col statcol"><em>Spe</em><br />' + pokemon.baseStats.spe + '</span> ';
+		var bst = 0;
+		for (i in pokemon.baseStats) bst += pokemon.baseStats[i];
+		buf += '<span class="col bstcol"><em>BST<br />' + bst + '</em></span> ';
+		buf += '</span>';
+
+		buf += '</a>';
+
+		return buf;
+	};
+
+	Search.prototype.renderItemRow = function (item, matchStart, matchLength, errorMessage, attrs) {
+		if (!attrs) attrs = '';
+		var id = toId(item.name);
+		if (Search.urlRoot) attrs += ' href="' + Search.urlRoot + 'items/' + id + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="item:' + Tools.escapeHTML(item.name) + '">';
+
+		// icon
+		buf += '<span class="col itemiconcol">';
+		buf += '<span style="' + Tools.getItemIcon(item) + '"></span>';
+		buf += '</span> ';
+
+		// name
+		var name = item.name;
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		buf += '<span class="col namecol">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		// desc
+		var desc = (item.shortDesc || item.desc);
+		if (this.gen < 6) {
+			for (var i = this.gen; i < 6; i++) {
+				if (id in BattleTeambuilderTable['gen' + i].overrideItemDesc) {
+					desc = BattleTeambuilderTable['gen' + i].overrideItemDesc[id];
+					break;
+				}
+			}
+		}
+		buf += '<span class="col itemdesccol">' + Tools.escapeHTML(desc) + '</span> ';
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+	Search.prototype.renderAbilityRow = function (ability, matchStart, matchLength, errorMessage, attrs) {
+		if (!attrs) attrs = '';
+		var id = toId(ability.name);
+		if (Search.urlRoot) attrs += ' href="' + Search.urlRoot + 'abilities/' + id + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="ability:' + Tools.escapeHTML(ability.name) + '">';
+
+		// name
+		var name = ability.name;
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		buf += '<span class="col namecol">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		buf += '<span class="col abilitydesccol">' + Tools.escapeHTML(ability.shortDesc || ability.desc) + '</span> ';
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+	Search.prototype.renderMoveRow = function (move, matchStart, matchLength, errorMessage, attrs) {
+		if (!attrs) attrs = '';
+		var id = toId(move.name);
+		if (Search.urlRoot) attrs += ' href="' + Search.urlRoot + 'moves/' + id + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="move:' + Tools.escapeHTML(move.name) + '">';
+
+		// name
+		var name = move.name;
+		var tagStart = (name.substr(0, 12) === 'Hidden Power' ? 12 : 0);
+		if (tagStart) name = name.substr(0, tagStart);
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		if (tagStart) {
+			if (matchLength && matchStart + matchLength > tagStart) {
+				if (matchStart < tagStart) {
+					matchLength -= tagStart - matchStart;
+					matchStart = tagStart;
+				}
+				name += '<small>' + move.name.substr(tagStart, matchStart - tagStart) + '<b>' + move.name.substr(matchStart, matchLength) + '</b>' + move.name.substr(matchStart + matchLength) + '</small>';
+			} else {
+				name += '<small>' + move.name.substr(tagStart) + '</small>';
+			}
+		}
+		buf += '<span class="col movenamecol">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		// type
+		buf += '<span class="col typecol">';
+		var type = move.type;
+		if (this.gen <= 1 && (id === 'bite' || id === 'gust' || id === 'karatechop' || id === 'sandattack')) type = 'Normal';
+		if (this.gen <= 5 && (id === 'charm' || id === 'moonlight' || id === 'sweetkiss')) type = 'Normal';
+		buf += Tools.getTypeIcon(type);
+		var category = Tools.getCategory(move, this.gen, type);
+		buf += '<img src="' + Tools.resourcePrefix + 'sprites/categories/' + category + '.png" alt="' + category + '" height="14" width="32" />';
+		buf += '</span> ';
+
+		// power, accuracy, pp
+		var basePower = move.basePower;
+		var accuracy = move.accuracy;
+		var pp = move.pp;
+		if (this.gen < 6) {
+			var table = BattleTeambuilderTable['gen' + this.gen];
+			if (id in table.overrideBP) basePower = table.overrideBP[id];
+			if (id in table.overrideAcc) accuracy = table.overrideAcc[id];
+			if (id in table.overridePP) pp = table.overridePP[id];
+		}
+		buf += '<span class="col labelcol">' + (move.category !== 'Status' ? ('<em>Power</em><br />' + (basePower || '&mdash;')) : '') + '</span> ';
+		buf += '<span class="col widelabelcol"><em>Accuracy</em><br />' + (accuracy && accuracy !== true ? accuracy + '%' : '&mdash;') + '</span> ';
+		buf += '<span class="col pplabelcol"><em>PP</em><br />' + (pp !== 1 ? pp * 8 / 5 : pp) + '</span> ';
+
+		// desc
+		var desc = (move.shortDesc || move.desc);
+		if (this.gen < 6) {
+			for (var i = this.gen; i < 6; i++) {
+				if (id in BattleTeambuilderTable['gen' + i].overrideMoveDesc) {
+					desc = BattleTeambuilderTable['gen' + i].overrideMoveDesc[id];
+					break;
+				}
+			}
+		}
+		buf += '<span class="col movedesccol">' + Tools.escapeHTML(desc) + '</span> ';
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+	Search.prototype.renderMoveRowInner = function (move, errorMessage) {
+		var attrs = '';
+		if (Search.urlRoot) attrs = ' href="' + Search.urlRoot + 'moves/' + toId(move.name) + '" data-target="push"';
+		var buf = '<a' + attrs + ' data-entry="move:' + Tools.escapeHTML(move.name) + '">';
+
+		// name
+		var name = move.name;
+		var tagStart = (name.substr(0, 12) === 'Hidden Power' ? 12 : 0);
+		if (tagStart) name = name.substr(0, tagStart) + '<small>' + move.name.substr(tagStart) + '</small>';
+		buf += '<span class="col movenamecol">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		// type
+		buf += '<span class="col typecol">';
+		buf += Tools.getTypeIcon(move.type);
+		buf += '<img src="' + Tools.resourcePrefix + 'sprites/categories/' + move.category + '.png" alt="' + move.category + '" height="14" width="32" />';
+		buf += '</span> ';
+
+		// power, accuracy, pp
+		buf += '<span class="col labelcol">' + (move.category !== 'Status' ? ('<em>Power</em><br />' + (move.basePower || '&mdash;')) : '') + '</span> ';
+		buf += '<span class="col widelabelcol"><em>Accuracy</em><br />' + (move.accuracy && move.accuracy !== true ? move.accuracy + '%' : '&mdash;') + '</span> ';
+		buf += '<span class="col pplabelcol"><em>PP</em><br />' + (move.pp !== 1 ? move.pp * 8 / 5 : move.pp) + '</span> ';
+
+		// desc
+		buf += '<span class="col movedesccol">' + Tools.escapeHTML(move.shortDesc || move.desc) + '</span> ';
+
+		buf += '</a>';
+
+		return buf;
+	};
+	Search.prototype.renderTaggedMoveRow = function (move, tag, errorMessage) {
+		var attrs = '';
+		if (Search.urlRoot) attrs = ' href="' + Search.urlRoot + 'moves/' + toId(move.name) + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="move:' + Tools.escapeHTML(move.name) + '">';
+
+		// tag
+		buf += '<span class="col tagcol">' + tag + '</span> ';
+
+		// name
+		var name = move.name;
+		if (name.substr(0, 12) === 'Hidden Power') name = 'Hidden Power';
+		buf += '<span class="col shortmovenamecol">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		// type
+		buf += '<span class="col typecol">';
+		buf += Tools.getTypeIcon(move.type);
+		buf += '<img src="' + Tools.resourcePrefix + 'sprites/categories/' + move.category + '.png" alt="' + move.category + '" height="14" width="32" />';
+		buf += '</span> ';
+
+		// power, accuracy, pp
+		buf += '<span class="col labelcol">' + (move.category !== 'Status' ? ('<em>Power</em><br />' + (move.basePower || '&mdash;')) : '') + '</span> ';
+		buf += '<span class="col widelabelcol"><em>Accuracy</em><br />' + (move.accuracy && move.accuracy !== true ? move.accuracy + '%' : '&mdash;') + '</span> ';
+		buf += '<span class="col pplabelcol"><em>PP</em><br />' + (move.pp !== 1 ? move.pp * 8 / 5 : move.pp) + '</span> ';
+
+		// desc
+		buf += '<span class="col movedesccol">' + Tools.escapeHTML(move.shortDesc || move.desc) + '</span> ';
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+
+	Search.prototype.renderTypeRow = function (type, matchStart, matchLength, errorMessage) {
+		var attrs = '';
+		if (Search.urlRoot) attrs = ' href="' + Search.urlRoot + 'types/' + toId(type.name) + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="type:' + Tools.escapeHTML(type.name) + '">';
+
+		// name
+		var name = type.name;
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		buf += '<span class="col namecol">' + name + '</span> ';
+
+		// type
+		buf += '<span class="col typecol">';
+		buf += Tools.getTypeIcon(type.name);
+		buf += '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+	Search.prototype.renderCategoryRow = function (category, matchStart, matchLength, errorMessage) {
+		var attrs = '';
+		if (Search.urlRoot) attrs = ' href="' + Search.urlRoot + 'categories/' + toId(category.name) + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="category:' + Tools.escapeHTML(category.name) + '">';
+
+		// name
+		var name = category.name;
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		buf += '<span class="col namecol">' + name + '</span> ';
+
+		// category
+		buf += '<span class="col typecol">';
+		buf += '<img src="' + Tools.resourcePrefix + 'sprites/categories/' + category.name + '.png" alt="' + category.name + '" height="14" width="32" />';
+		buf += '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+	Search.prototype.renderEggGroupRow = function (egggroup, matchStart, matchLength, errorMessage) {
+		var attrs = '';
+		if (Search.urlRoot) attrs = ' href="' + Search.urlRoot + 'egggroups/' + toId(egggroup.name) + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="egggroup:' + Tools.escapeHTML(egggroup.name) + '">';
+
+		// name
+		var name = egggroup.name;
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		buf += '<span class="col namecol">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+	Search.prototype.renderTierRow = function (tier, matchStart, matchLength, errorMessage) {
+		var attrs = '';
+		if (Search.urlRoot) attrs = ' href="' + Search.urlRoot + 'tiers/' + toId(tier.name) + '" data-target="push"';
+		var buf = '<li class="result"><a' + attrs + ' data-entry="tier:' + Tools.escapeHTML(tier.name) + '">';
+
+		// name
+		var name = tier.name;
+		if (matchLength) {
+			name = name.substr(0, matchStart) + '<b>' + name.substr(matchStart, matchLength) + '</b>' + name.substr(matchStart + matchLength);
+		}
+		buf += '<span class="col namecol">' + name + '</span> ';
+
+		// error
+		if (errorMessage) {
+			buf += errorMessage + '</a></li>';
+			return buf;
+		}
+
+		buf += '</a></li>';
+
+		return buf;
+	};
+
+	Search.gen = 6;
+	Search.renderRow = Search.prototype.renderRow;
+	Search.renderPokemonRow = Search.prototype.renderPokemonRow;
+	Search.renderTaggedPokemonRowInner = Search.prototype.renderTaggedPokemonRowInner;
+	Search.renderItemRow = Search.prototype.renderItemRow;
+	Search.renderAbilityRow = Search.prototype.renderAbilityRow;
+	Search.renderMoveRow = Search.prototype.renderMoveRow;
+	Search.renderMoveRowInner = Search.prototype.renderMoveRowInner;
+	Search.renderTaggedMoveRow = Search.prototype.renderTaggedMoveRow;
+	Search.renderTypeRow = Search.prototype.renderTypeRow;
+	Search.renderCategoryRow = Search.prototype.renderCategoryRow;
+	Search.renderEggGroupRow = Search.prototype.renderEggGroupRow;
+	Search.renderTierRow = Search.prototype.renderTierRow;
+
+	exports.BattleSearch = Search;
+
+})(window, jQuery);

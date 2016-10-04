@@ -1,0 +1,17 @@
+{
+  "name": "Pokemon Showdown",
+  "version": "0.3.0",
+
+  "main": "index.html",
+  "node-remote": "play.pokemonshowdown.com",
+  "no-edit-menu": false,
+  "window": {
+	  "icon": "icons/icon_32x32.png",
+    "title": "Loading...",
+    "toolbar": false,
+    "show": false
+  },
+  "webkit": {
+    "plugin": true
+  }
+}
