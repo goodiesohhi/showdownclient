@@ -1,7 +1,7 @@
 /sprites/
 /audio/
 /js/config.js
-
+/index.html
 /data/*
 !/data/graphics.js
 !/data/pokedex-mini.js
