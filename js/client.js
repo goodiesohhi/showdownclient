@@ -1,4 +1,4 @@
-(function ($) {
+﻿(function ($) {
 
 	Config.version = '0.10.2';
 

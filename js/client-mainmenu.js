@@ -1,4 +1,4 @@
-(function ($) {
+﻿(function ($) {
 
 	var MainMenuRoom = this.MainMenuRoom = this.Room.extend({
 		type: 'mainmenu',
