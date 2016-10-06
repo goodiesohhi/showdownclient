@@ -370,14 +370,14 @@
 			this.supports = {};
 
 			// down
-			// if (document.location.hostname === 'play.pokemonshowdown.com') this.down = 'dos';
+			// if (document.location.hostname === 'goodiesshowdown.herokuapp.com') this.down = 'dos';
 
 			this.addRoom('');
 			this.topbar = new Topbar({el: $('#header')});
 			if (this.down) {
 				this.isDisconnected = true;
 			} else if ($(window).width() >= 916) {
-				if (document.location.hostname === 'play.pokemonshowdown.com' || Config.testclient) {
+				if (document.location.hostname === 'goodiesshowdown.herokuapp.com' || Config.testclient) {
 					this.addRoom('rooms', null, true);
 					Storage.whenPrefsLoaded(function () {
 						var autojoin = (Tools.prefs('autojoin') || '');
